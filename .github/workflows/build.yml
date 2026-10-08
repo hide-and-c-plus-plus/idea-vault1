@@ -1,35 +1,139 @@
-name: Butild APK
+
+name: Build Android 15 Compatible APK
+
 on:
   push:
   workflow_dispatch:
+
 permissions:
   contents: write
+
 jobs:
   apk:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - run: for z in *.zip; do unzip -q -o "$z"; done
-      - uses: actions/setup-node@v4
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Extract Project
+        shell: bash
+        run: |
+          set -e
+          shopt -s nullglob
+          for z in *.zip; do
+            unzip -q -o "$z"
+          done
+          test -f idea-management-app/package.json
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
         with:
-          node-version: 22
-      - uses: actions/setup-java@v4
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: idea-management-app/package-lock.json
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
         with:
           distribution: temurin
-          java-version: 17
-      - run: npm ci --no-audit --no-fund
+          java-version: '17'
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Dependencies
         working-directory: idea-management-app
-      - run: npx expo prebuild --platform android --no-install
+        run: npm ci --no-audit --no-fund
+
+      - name: Update Android Version Code
         working-directory: idea-management-app
-      - run: chmod +x gradlew && ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a
+        run: |
+          node - <<'NODE'
+          const fs = require('fs');
+          const file = 'app.json';
+          const data = JSON.parse(fs.readFileSync(file, 'utf8'));
+
+          data.expo.android ??= {};
+          data.expo.android.versionCode =
+            100000 + Number(process.env.GITHUB_RUN_NUMBER);
+
+          fs.writeFileSync(
+            file,
+            JSON.stringify(data, null, 2) + '\n'
+          );
+          NODE
+
+      - name: Generate Android Project
+        working-directory: idea-management-app
+        run: |
+          npx expo prebuild \
+            --platform android \
+            --no-install \
+            --clean
+
+      - name: Configure Installable APK Signing
+        shell: bash
+        run: |
+          cat >> idea-management-app/android/app/build.gradle <<'GRADLE'
+
+          android {
+              buildTypes {
+                  release {
+                      signingConfig signingConfigs.debug
+                  }
+              }
+          }
+          GRADLE
+
+      - name: Build Universal Release APK
         working-directory: idea-management-app/android
-      - uses: actions/upload-artifact@v4
+        env:
+          NODE_ENV: production
+        run: |
+          chmod +x gradlew
+
+          ./gradlew :app:assembleRelease \
+            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86,x86_64 \
+            --no-daemon \
+            --stacktrace
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -e
+
+          APK="idea-management-app/android/app/build/outputs/apk/release/app-release.apk"
+
+          test -s "$APK"
+
+          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
+            -mindepth 1 -maxdepth 1 -type d \
+            | sort -V | tail -1)"
+
+          "$BUILD_TOOLS/apksigner" verify \
+            --verbose "$APK"
+
+          "$BUILD_TOOLS/aapt" dump badging "$APK" \
+            | grep -E 'package:|sdkVersion:|targetSdkVersion:|native-code:'
+
+          mkdir -p dist
+          cp "$APK" dist/Idea-Vault-Android15.apk
+
+      - name: Upload APK Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: idea-vault-apk
-          path: idea-management-app/android/app/build/outputs/apk/release/app-release.apk
-      - run: |
-          gh release create "build-${{ github.run_number }}" \
-            idea-management-app/android/app/build/outputs/apk/release/app-release.apk \
-            --title "Idea Vault build ${{ github.run_number }}" --notes "Release APK"
+          name: Idea-Vault-Android15
+          path: dist/Idea-Vault-Android15.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create \
+            "build-${{ github.run_id }}-${{ github.run_attempt }}" \
+            dist/Idea-Vault-Android15.apk \
+            --title "Idea Vault Build ${{ github.run_number }}" \
+            --notes "Universal Android APK, including ARM64 support for Android 15 devices."
