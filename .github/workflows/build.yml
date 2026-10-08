@@ -1,4 +1,4 @@
-name: Build APK
+name: Butild APK
 on:
   push:
   workflow_dispatch:
