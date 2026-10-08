@@ -1,0 +1,35 @@
+name: Build APK
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  apk:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: for z in *.zip; do unzip -q -o "$z"; done
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+      - run: npm ci --no-audit --no-fund
+        working-directory: idea-management-app
+      - run: npx expo prebuild --platform android --no-install
+        working-directory: idea-management-app
+      - run: chmod +x gradlew && ./gradlew assembleRelease -PreactNativeArchitectures=arm64-v8a,armeabi-v7a
+        working-directory: idea-management-app/android
+      - uses: actions/upload-artifact@v4
+        with:
+          name: idea-vault-apk
+          path: idea-management-app/android/app/build/outputs/apk/release/app-release.apk
+      - run: |
+          gh release create "build-${{ github.run_number }}" \
+            idea-management-app/android/app/build/outputs/apk/release/app-release.apk \
+            --title "Idea Vault build ${{ github.run_number }}" --notes "Release APK"
+        env:
+          GH_TOKEN: ${{ github.token }}
