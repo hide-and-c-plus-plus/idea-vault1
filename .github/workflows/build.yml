@@ -1,5 +1,4 @@
-
-name: Build Android 15 Compatible APK
+name: Build and Verify APK
 
 on:
   push:
@@ -11,129 +10,89 @@ permissions:
 jobs:
   apk:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout Repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Extract Project
+      - name: Extract uploaded source archive
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
           shopt -s nullglob
           for z in *.zip; do
             unzip -q -o "$z"
           done
           test -f idea-management-app/package.json
+          test -f idea-management-app/package-lock.json
 
-      - name: Setup Node.js
+      - name: Set up Node
         uses: actions/setup-node@v4
         with:
-          node-version: '22'
+          node-version: 22
           cache: npm
           cache-dependency-path: idea-management-app/package-lock.json
 
-      - name: Setup Java
+      - name: Set up Java
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Install Dependencies
-        working-directory: idea-management-app
+      - name: Install dependencies
         run: npm ci --no-audit --no-fund
-
-      - name: Update Android Version Code
         working-directory: idea-management-app
-        run: |
-          node - <<'NODE'
-          const fs = require('fs');
-          const file = 'app.json';
-          const data = JSON.parse(fs.readFileSync(file, 'utf8'));
 
-          data.expo.android ??= {};
-          data.expo.android.versionCode =
-            100000 + Number(process.env.GITHUB_RUN_NUMBER);
-
-          fs.writeFileSync(
-            file,
-            JSON.stringify(data, null, 2) + '\n'
-          );
-          NODE
-
-      - name: Generate Android Project
+      - name: Generate Android project
+        run: npx expo prebuild --platform android --no-install
         working-directory: idea-management-app
-        run: |
-          npx expo prebuild \
-            --platform android \
-            --no-install \
-            --clean
 
-      - name: Configure Installable APK Signing
-        shell: bash
-        run: |
-          cat >> idea-management-app/android/app/build.gradle <<'GRADLE'
-
-          android {
-              buildTypes {
-                  release {
-                      signingConfig signingConfigs.debug
-                  }
-              }
-          }
-          GRADLE
-
-      - name: Build Universal Release APK
+      - name: Build release APK for all default ABIs
+        run: chmod +x gradlew && ./gradlew :app:assembleRelease --stacktrace
         working-directory: idea-management-app/android
-        env:
-          NODE_ENV: production
-        run: |
-          chmod +x gradlew
 
-          ./gradlew :app:assembleRelease \
-            -PreactNativeArchitectures=arm64-v8a,armeabi-v7a,x86,x86_64 \
-            --no-daemon \
-            --stacktrace
-
-      - name: Verify APK
+      - name: Verify APK integrity, package, and signature
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
+          apk=idea-management-app/android/app/build/outputs/apk/release/app-release.apk
+          test -s "$apk"
+          unzip -tqq "$apk"
+          sdk="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          test -n "$sdk"
+          tools="$(find "$sdk/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -n 1)"
+          test -x "$tools/apksigner"
+          "$tools/apksigner" verify --verbose --print-certs "$apk"
+          "$tools/aapt" dump badging "$apk" | grep -E '^package:|^sdkVersion:|^native-code:'
 
-          APK="idea-management-app/android/app/build/outputs/apk/release/app-release.apk"
+      - name: Enable KVM for emulator
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
 
-          test -s "$APK"
+      - name: Test APK installation on Android emulator
+        uses: reactivecircus/android-emulator-runner@v2
+        with:
+          api-level: 35
+          target: google_apis
+          arch: x86_64
+          script: |
+            adb install -r idea-management-app/android/app/build/outputs/apk/release/app-release.apk
+            adb shell pm path com.localfirst.ideavault
 
-          BUILD_TOOLS="$(find "$ANDROID_HOME/build-tools" \
-            -mindepth 1 -maxdepth 1 -type d \
-            | sort -V | tail -1)"
-
-          "$BUILD_TOOLS/apksigner" verify \
-            --verbose "$APK"
-
-          "$BUILD_TOOLS/aapt" dump badging "$APK" \
-            | grep -E 'package:|sdkVersion:|targetSdkVersion:|native-code:'
-
-          mkdir -p dist
-          cp "$APK" dist/Idea-Vault-Android15.apk
-
-      - name: Upload APK Artifact
+      - name: Upload installable APK
         uses: actions/upload-artifact@v4
         with:
-          name: Idea-Vault-Android15
-          path: dist/Idea-Vault-Android15.apk
+          name: idea-vault-apk
+          path: idea-management-app/android/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
-          retention-days: 30
 
       - name: Publish GitHub Release
+        shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create \
-            "build-${{ github.run_id }}-${{ github.run_attempt }}" \
-            dist/Idea-Vault-Android15.apk \
-            --title "Idea Vault Build ${{ github.run_number }}" \
-            --notes "Universal Android APK, including ARM64 support for Android 15 devices."
+          gh release create "build-${{ github.run_number }}-${{ github.run_attempt }}" \
+            idea-management-app/android/app/build/outputs/apk/release/app-release.apk \
+            --title "Idea Vault build ${{ github.run_number }}" \
+            --notes "APK passed integrity/signature checks and emulator installation test. For internal testing; not production-signed."
